@@ -1,0 +1,845 @@
+import { useState, useEffect, useMemo, useRef } from "react";
+import Dexie from "https://cdn.jsdelivr.net/npm/dexie@3/dist/dexie.mjs";
+import {
+  LineChart, Line, BarChart, Bar, ScatterChart, Scatter,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine
+} from "recharts";
+
+// ── DB (v2 adds templates + reflections) ────────────────────────────────────
+const db = new Dexie("ExistenceDB");
+db.version(1).stores({ blocks: "id, date, pillar" });
+db.version(2).stores({ blocks: "id, date, pillar", templates: "id", reflections: "weekStart" });
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const DEFAULT_PILLARS = [
+  { id: "life",   label: "Life",   color: "#E8C547", icon: "✦" },
+  { id: "work",   label: "Work",   color: "#47B8E8", icon: "◈" },
+  { id: "health", label: "Health", color: "#47E87A", icon: "◎" },
+  { id: "sleep",  label: "Sleep",  color: "#B847E8", icon: "◐" },
+];
+const PRESET_COLORS = [
+  "#E8C547","#47B8E8","#47E87A","#B847E8","#E84747","#E88047","#47E8D4","#E847A8",
+  "#8DE847","#4763E8","#E8E447","#E8476B","#00C9A7","#FF6B6B","#4ECDC4","#FFE66D",
+];
+
+// Half-hour slots: 0, 0.5, 1, 1.5 … 23.5
+const SLOTS = Array.from({ length: 48 }, (_, i) => {
+  const h = Math.floor(i / 2);
+  const m = i % 2 === 0 ? "00" : "30";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  const ampm = h < 12 ? "AM" : "PM";
+  return { value: i / 2, label: `${h12}:${m} ${ampm}` };
+});
+const fmtSlot = v => {
+  const h = Math.floor(v), m = v % 1 === 0.5 ? "30" : "00";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${m} ${h < 12 ? "AM" : "PM"}`;
+};
+const slotHrs = (s, e) => e - s; // fractional hours
+
+// ── Themes ────────────────────────────────────────────────────────────────────
+const THEMES = {
+  dark: {
+    bg:"#080808", surface:"#0e0e0e", surfaceAlt:"#111", border:"#1a1a1a",
+    borderMid:"#222", borderSub:"#131313", text:"#e8e4dc", textMid:"#aaa",
+    textSub:"#555", textFaint:"#333", textMuted:"#444", headerBg:"#080808",
+    navActive:"#1a1a1a", navBorder:"#2a2a2a", todayBg:"#111", inputBg:"#141414",
+    addBtn:"#e8e4dc", addBtnTxt:"#080808", ttBg:"#111", ttBorder:"#222",
+    gridLine:"#161616", refLine:"#2a2a2a", empty:"#333", emptyFaint:"#2a2a2a",
+    warnBg:"#2a0f0f", warnBorder:"#5a1a1a", warnText:"#ff6b6b",
+  },
+  light: {
+    bg:"#f5f3ef", surface:"#fff", surfaceAlt:"#fafaf8", border:"#e8e4dc",
+    borderMid:"#d8d4cc", borderSub:"#eeebe4", text:"#1a1814", textMid:"#4a4640",
+    textSub:"#888480", textFaint:"#bbb8b0", textMuted:"#999690", headerBg:"#fff",
+    navActive:"#f0ede6", navBorder:"#d8d4cc", todayBg:"#f8f6f0", inputBg:"#f5f3ef",
+    addBtn:"#1a1814", addBtnTxt:"#f5f3ef", ttBg:"#fff", ttBorder:"#ddd",
+    gridLine:"#eeebe4", refLine:"#d8d4cc", empty:"#aaa8a0", emptyFaint:"#ccc9c0",
+    warnBg:"#fff5f5", warnBorder:"#fcc", warnText:"#c44",
+  },
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const generateId = () => Math.random().toString(36).slice(2, 9);
+const today      = () => new Date().toISOString().slice(0, 10);
+const formatDate = d => new Date(d+"T12:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+const shortDate  = d => new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"});
+function getWeekStart(ds) { const d=new Date(ds+"T12:00:00"); d.setDate(d.getDate()-d.getDay()); return d.toISOString().slice(0,10); }
+function addDays(ds,n) { const d=new Date(ds+"T12:00:00"); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); }
+function getWeekDates(ws) { return Array.from({length:7},(_,i)=>addDays(ws,i)); }
+function formatWeekRange(ws) {
+  const s=new Date(ws+"T12:00:00"), e=new Date(addDays(ws,6)+"T12:00:00");
+  return `${s.toLocaleDateString("en-US",{month:"short",day:"numeric"})} – ${e.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}`;
+}
+
+// Overlap detection: do two blocks share any time on the same date?
+function blocksOverlap(a, b) {
+  if (a.date !== b.date || a.id === b.id) return false;
+  return a.startHour < b.endHour && b.startHour < a.endHour;
+}
+function findOverlaps(block, allBlocks) {
+  return allBlocks.filter(b => blocksOverlap(block, b));
+}
+
+// ── Sample data ───────────────────────────────────────────────────────────────
+function buildSamples() {
+  const tpls = [
+    { pillar:"sleep",  activity:"Sleep",              startHour:23,   endHour:7,   baseRating:8 },
+    { pillar:"health", activity:"Morning workout",    startHour:7,    endHour:8,   baseRating:8 },
+    { pillar:"life",   activity:"Breakfast",          startHour:8,    endHour:8.5, baseRating:8 },
+    { pillar:"work",   activity:"Deep work",          startHour:9,    endHour:12,  baseRating:7 },
+    { pillar:"life",   activity:"Lunch",              startHour:12,   endHour:12.5,baseRating:7 },
+    { pillar:"work",   activity:"Meetings",           startHour:13,   endHour:16,  baseRating:5 },
+    { pillar:"health", activity:"Evening walk",       startHour:17,   endHour:17.5,baseRating:8 },
+    { pillar:"life",   activity:"Dinner & wind down", startHour:18,   endHour:21,  baseRating:8 },
+  ];
+  const srs = [6,5,8,9,7,8,6,9,7,8,5,9,8,7];
+  const out = [];
+  for (let i=13;i>=0;i--) {
+    const date=addDays(today(),-i), sr=srs[i]??7;
+    tpls.forEach(t => {
+      const boost=sr>=8?1:sr<=5?-1:0, noise=Math.round((Math.random()-.5)*2);
+      const r=t.pillar==="sleep"?sr:Math.max(1,Math.min(10,t.baseRating+boost+noise));
+      out.push({id:generateId(),date,pillar:t.pillar,activity:t.activity,startHour:t.startHour,endHour:t.endHour,rating:r,note:""});
+    });
+  }
+  return out;
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+function ChartCard({ title, subtitle, children, span, T }) {
+  return (
+    <div style={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:14,padding:"22px 24px",gridColumn:span?`span ${span}`:undefined}}>
+      <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.1em",color:T.text,marginBottom:subtitle?4:18}}>{title}</div>
+      {subtitle&&<div style={{fontSize:11,color:T.textMuted,marginBottom:18}}>{subtitle}</div>}
+      {children}
+    </div>
+  );
+}
+
+function ColorPicker({ value, onChange, T }) {
+  const [open,setOpen]=useState(false);
+  const ref=useRef();
+  useEffect(()=>{ const h=e=>{ if(ref.current&&!ref.current.contains(e.target))setOpen(false); }; document.addEventListener("mousedown",h); return()=>document.removeEventListener("mousedown",h); },[]);
+  return (
+    <div ref={ref} style={{position:"relative"}}>
+      <div onClick={()=>setOpen(o=>!o)} style={{width:36,height:36,borderRadius:8,background:value,cursor:"pointer",border:`2px solid ${T.border}`,boxShadow:open?`0 0 0 2px ${value}44`:"none",transition:"box-shadow 0.15s"}}/>
+      {open&&(
+        <div style={{position:"absolute",top:44,left:0,zIndex:300,background:T.surface,border:`1px solid ${T.border}`,borderRadius:12,padding:12,display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,width:172,boxShadow:"0 8px 32px rgba(0,0,0,0.3)"}}>
+          {PRESET_COLORS.map(c=>(
+            <div key={c} onClick={()=>{onChange(c);setOpen(false);}} style={{width:32,height:32,borderRadius:6,background:c,cursor:"pointer",border:value===c?`2px solid ${T.text}`:"2px solid transparent",transition:"border 0.1s",boxSizing:"border-box"}}/>
+          ))}
+          <div style={{gridColumn:"span 4",marginTop:4}}>
+            <div style={{fontSize:10,color:T.textMuted,letterSpacing:"0.1em",marginBottom:6}}>CUSTOM HEX</div>
+            <input defaultValue={value}
+              onBlur={e=>{const v=e.target.value;if(/^#[0-9a-fA-F]{6}$/.test(v)){onChange(v);setOpen(false);}}}
+              onKeyDown={e=>{if(e.key==="Enter"){const v=e.target.value;if(/^#[0-9a-fA-F]{6}$/.test(v)){onChange(v);setOpen(false);}}}}
+              placeholder="#RRGGBB"
+              style={{width:"100%",background:T.inputBg,border:`1px solid ${T.border}`,borderRadius:6,padding:"6px 8px",color:T.text,fontSize:11,outline:"none",boxSizing:"border-box"}}/>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Slot selector ─────────────────────────────────────────────────────────────
+function SlotSelect({ value, onChange, T, style }) {
+  return (
+    <select value={value} onChange={e=>onChange(Number(e.target.value))}
+      style={{width:"100%",background:T.inputBg,border:`1px solid ${T.borderMid}`,borderRadius:8,padding:"10px 14px",color:T.text,fontSize:13,outline:"none",cursor:"pointer",...style}}>
+      {SLOTS.map(s=><option key={s.value} value={s.value}>{s.label}</option>)}
+    </select>
+  );
+}
+
+// ── App ────────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [blocks,       setBlocks]       = useState([]);
+  const [templates,    setTemplates]    = useState([]);
+  const [reflections,  setReflections]  = useState({});
+  const [dbReady,      setDbReady]      = useState(false);
+  const [view,         setView]         = useState("today");
+  const [selectedDate, setSelectedDate] = useState(today());
+  const [weekStart,    setWeekStart]    = useState(getWeekStart(today()));
+  const [showModal,    setShowModal]    = useState(false);
+  const [editBlock,    setEditBlock]    = useState(null);
+  const [overlapWarn,  setOverlapWarn]  = useState([]);
+  const [form,         setForm]         = useState({pillar:"work",activity:"",startHour:9,endHour:10,rating:7,note:""});
+  const [hoveredBlock, setHoveredBlock] = useState(null);
+  // Template modal
+  const [showTplModal, setShowTplModal] = useState(false);
+  const [editTpl,      setEditTpl]      = useState(null);
+  const [tplForm,      setTplForm]      = useState({pillar:"work",activity:"",startHour:9,endHour:10});
+  // Reflection
+  const [reflForm,     setReflForm]     = useState({overallRating:7,text:""});
+
+  // Theme
+  const [isDark, setIsDark] = useState(()=>{ try{return localStorage.getItem("existence_theme")!=="light";}catch{return true;} });
+  const [pillarColors, setPillarColors] = useState(()=>{
+    try{const s=JSON.parse(localStorage.getItem("existence_pillar_colors")||"null");if(s&&DEFAULT_PILLARS.every(p=>s[p.id]))return s;}catch{}
+    return Object.fromEntries(DEFAULT_PILLARS.map(p=>[p.id,p.color]));
+  });
+  useEffect(()=>{ try{localStorage.setItem("existence_theme",isDark?"dark":"light");}catch{} },[isDark]);
+  useEffect(()=>{ try{localStorage.setItem("existence_pillar_colors",JSON.stringify(pillarColors));}catch{} },[pillarColors]);
+
+  const T = isDark ? THEMES.dark : THEMES.light;
+  const PILLARS   = useMemo(()=>DEFAULT_PILLARS.map(p=>({...p,color:pillarColors[p.id]})),[pillarColors]);
+  const PILLAR_MAP= useMemo(()=>Object.fromEntries(PILLARS.map(p=>[p.id,p])),[PILLARS]);
+  const TT        = {background:T.ttBg,border:`1px solid ${T.ttBorder}`,borderRadius:8,fontSize:11,color:T.text};
+
+  // ── DB load ──────────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    Promise.all([db.blocks.toArray(), db.templates.toArray(), db.reflections.toArray()]).then(([blks,tpls,refls])=>{
+      if(blks.length===0){
+        const s=buildSamples();
+        db.blocks.bulkAdd(s).then(()=>{ setBlocks(s); setTemplates(tpls); loadReflections(refls); setDbReady(true); });
+      } else { setBlocks(blks); setTemplates(tpls); loadReflections(refls); setDbReady(true); }
+    });
+  },[]);
+
+  function loadReflections(rows) {
+    setReflections(Object.fromEntries(rows.map(r=>[r.weekStart,r])));
+  }
+
+  // ── Derived ──────────────────────────────────────────────────────────────────
+  const dayBlocks = useMemo(()=>blocks.filter(b=>b.date===selectedDate).sort((a,b)=>a.startHour-b.startHour),[blocks,selectedDate]);
+  const allDates  = useMemo(()=>[...new Set(blocks.map(b=>b.date))].sort().reverse(),[blocks]);
+  const weekDates = useMemo(()=>getWeekDates(weekStart),[weekStart]);
+  const weekBlocks= useMemo(()=>{ const s=new Set(weekDates); return blocks.filter(b=>s.has(b.date)).sort((a,b)=>a.date.localeCompare(b.date)||a.startHour-b.startHour); },[blocks,weekDates]);
+  const weekStats = useMemo(()=>{
+    const ph={}; PILLARS.forEach(p=>{ph[p.id]=0;});
+    weekBlocks.forEach(b=>{ph[b.pillar]+=slotHrs(b.startHour,b.endHour);});
+    const total=Object.values(ph).reduce((a,b)=>a+b,0);
+    return{pillarHours:ph,total,avgRating:weekBlocks.length?(weekBlocks.reduce((a,b)=>a+b.rating,0)/weekBlocks.length).toFixed(1):"—"};
+  },[weekBlocks,PILLARS]);
+  const analytics = useMemo(()=>{
+    const ph={},pr={}; PILLARS.forEach(p=>{ph[p.id]=0;pr[p.id]=[];});
+    blocks.forEach(b=>{ph[b.pillar]+=slotHrs(b.startHour,b.endHour);pr[b.pillar].push(b.rating);});
+    const total=Object.values(ph).reduce((a,b)=>a+b,0);
+    return PILLARS.map(p=>({...p,hours:+ph[p.id].toFixed(1),pct:total>0?Math.round((ph[p.id]/total)*100):0,avgRating:pr[p.id].length?(pr[p.id].reduce((a,b)=>a+b,0)/pr[p.id].length).toFixed(1):"—"}));
+  },[blocks,PILLARS]);
+  const overallScore=useMemo(()=>blocks.length?(blocks.reduce((a,b)=>a+b.rating,0)/blocks.length).toFixed(1):0,[blocks]);
+  const dashData=useMemo(()=>{
+    const days=Array.from({length:14},(_,i)=>addDays(today(),-(13-i)));
+    return days.map(date=>{
+      const db_=blocks.filter(b=>b.date===date); if(!db_.length)return null;
+      const row={date,label:shortDate(date)};
+      PILLARS.forEach(p=>{const pb=db_.filter(b=>b.pillar===p.id);row[p.id+"_hrs"]=pb.reduce((a,b)=>a+slotHrs(b.startHour,b.endHour),0);row[p.id+"_avg"]=pb.length?+(pb.reduce((a,b)=>a+b.rating,0)/pb.length).toFixed(2):null;});
+      row.overall=+(db_.reduce((a,b)=>a+b.rating,0)/db_.length).toFixed(2);
+      return row;
+    }).filter(Boolean);
+  },[blocks,PILLARS]);
+  const sleepScatterData=useMemo(()=>{
+    const sorted=[...allDates].sort();
+    return sorted.slice(0,-1).flatMap(date=>{
+      const sb=blocks.filter(b=>b.date===date&&b.pillar==="sleep"), nb=blocks.filter(b=>b.date===addDays(date,1));
+      if(!sb.length||!nb.length)return[];
+      return[{sleepRating:+(sb.reduce((a,b)=>a+b.rating,0)/sb.length).toFixed(1),nextDayOverall:+(nb.reduce((a,b)=>a+b.rating,0)/nb.length).toFixed(1)}];
+    });
+  },[blocks,allDates]);
+  const pillarTrendData =useMemo(()=>dashData.map(d=>({label:d.label,Life:d.life_avg,Work:d.work_avg,Health:d.health_avg,Sleep:d.sleep_avg})),[dashData]);
+  const workBurnoutData =useMemo(()=>dashData.map(d=>({label:d.label,"Work Hours":d.work_hrs,"Work Quality":d.work_avg})),[dashData]);
+  const pillarStackData =useMemo(()=>dashData.map(d=>({label:d.label,Life:d.life_hrs,Work:d.work_hrs,Health:d.health_hrs,Sleep:d.sleep_hrs})),[dashData]);
+  const currentRefl = reflections[weekStart] || null;
+
+  // ── Block CRUD ───────────────────────────────────────────────────────────────
+  function openAdd(dateOverride) {
+    if(dateOverride) setSelectedDate(dateOverride);
+    setEditBlock(null);
+    setForm({pillar:"work",activity:"",startHour:9,endHour:10,rating:7,note:""});
+    setOverlapWarn([]);
+    setShowModal(true);
+  }
+  function openEdit(block) { setEditBlock(block); setForm({...block}); setOverlapWarn([]); setShowModal(true); }
+
+  function checkOverlaps(f, exceptId) {
+    const candidate = {...f, id: exceptId||"__new__"};
+    const others = blocks.filter(b=>b.date===selectedDate&&b.id!==exceptId);
+    return others.filter(b=>blocksOverlap(candidate,b));
+  }
+
+  function handleFormChange(patch) {
+    const newForm = {...form,...patch};
+    setForm(newForm);
+    const ov = checkOverlaps(newForm, editBlock?.id);
+    setOverlapWarn(ov);
+  }
+
+  async function saveBlock() {
+    if(!form.activity.trim()) return;
+    if(form.startHour>=form.endHour){alert("End time must be after start time.");return;}
+    if(editBlock){
+      const updated={...form,id:editBlock.id,date:selectedDate};
+      await db.blocks.put(updated);
+      setBlocks(prev=>prev.map(b=>b.id===editBlock.id?updated:b));
+    } else {
+      const nb={...form,id:generateId(),date:selectedDate};
+      await db.blocks.add(nb);
+      setBlocks(prev=>[...prev,nb]);
+    }
+    setShowModal(false);
+  }
+  async function deleteBlock(id) { await db.blocks.delete(id); setBlocks(prev=>prev.filter(b=>b.id!==id)); setShowModal(false); }
+
+  // Apply template to selectedDate
+  async function applyTemplate(tpl) {
+    const nb={id:generateId(),date:selectedDate,pillar:tpl.pillar,activity:tpl.activity,startHour:tpl.startHour,endHour:tpl.endHour,rating:7,note:""};
+    await db.blocks.add(nb);
+    setBlocks(prev=>[...prev,nb]);
+  }
+
+  // ── Template CRUD ─────────────────────────────────────────────────────────
+  function openAddTpl() { setEditTpl(null); setTplForm({pillar:"work",activity:"",startHour:9,endHour:10}); setShowTplModal(true); }
+  function openEditTpl(t) { setEditTpl(t); setTplForm({...t}); setShowTplModal(true); }
+  async function saveTpl() {
+    if(!tplForm.activity.trim()) return;
+    if(editTpl){
+      const u={...tplForm,id:editTpl.id};
+      await db.templates.put(u); setTemplates(prev=>prev.map(t=>t.id===editTpl.id?u:t));
+    } else {
+      const nt={...tplForm,id:generateId()};
+      await db.templates.add(nt); setTemplates(prev=>[...prev,nt]);
+    }
+    setShowTplModal(false);
+  }
+  async function deleteTpl(id) { await db.templates.delete(id); setTemplates(prev=>prev.filter(t=>t.id!==id)); setShowTplModal(false); }
+
+  // ── Reflection CRUD ────────────────────────────────────────────────────────
+  useEffect(()=>{
+    const r=reflections[weekStart];
+    setReflForm(r?{overallRating:r.overallRating,text:r.text}:{overallRating:7,text:""});
+  },[weekStart,reflections]);
+
+  async function saveReflection() {
+    const r={weekStart,overallRating:reflForm.overallRating,text:reflForm.text,updatedAt:new Date().toISOString()};
+    await db.reflections.put(r);
+    setReflections(prev=>({...prev,[weekStart]:r}));
+  }
+
+  const activePillar = PILLAR_MAP[form.pillar];
+  const tplPillar    = PILLAR_MAP[tplForm.pillar];
+
+  if(!dbReady) return <div style={{minHeight:"100vh",background:T.bg,display:"flex",alignItems:"center",justifyContent:"center",color:T.textSub,fontFamily:"Georgia,serif",letterSpacing:"0.2em",fontSize:12}}>LOADING...</div>;
+
+  // ── Shared style helpers ──────────────────────────────────────────────────
+  const card_   = {background:T.surface,border:`1px solid ${T.border}`,borderRadius:12};
+  const lbl_    = {fontSize:10,color:T.textMuted,letterSpacing:"0.15em",display:"block",marginBottom:8};
+  const inp_    = {width:"100%",background:T.inputBg,border:`1px solid ${T.borderMid}`,borderRadius:8,padding:"10px 14px",color:T.text,fontSize:14,outline:"none",boxSizing:"border-box"};
+  const navBtn_ = (a)=>({background:a?T.navActive:"transparent",border:a?`1px solid ${T.navBorder}`:"1px solid transparent",color:a?T.text:T.textSub,padding:"6px 16px",borderRadius:6,cursor:"pointer",fontSize:11,letterSpacing:"0.12em",textTransform:"uppercase",transition:"all 0.2s"});
+
+  return (
+    <div style={{minHeight:"100vh",background:T.bg,color:T.text,fontFamily:"'Georgia','Times New Roman',serif",display:"flex",flexDirection:"column"}}>
+
+      {/* ── Header ── */}
+      <header style={{borderBottom:`1px solid ${T.border}`,padding:"0 32px",display:"flex",alignItems:"center",justifyContent:"space-between",height:64,background:T.headerBg,position:"sticky",top:0,zIndex:100}}>
+        <div style={{display:"flex",alignItems:"baseline",gap:12}}>
+          <span style={{fontSize:22,fontWeight:700,letterSpacing:"0.15em"}}>EXISTENCE</span>
+          <span style={{fontSize:11,color:T.textMuted,letterSpacing:"0.2em"}}>TIME INTELLIGENCE</span>
+        </div>
+        <nav style={{display:"flex",gap:4}}>
+          {["today","week","dashboard","analytics","settings"].map(v=>(
+            <button key={v} onClick={()=>setView(v)} style={navBtn_(view===v)}>{v}</button>
+          ))}
+        </nav>
+        <div style={{display:"flex",alignItems:"center",gap:16}}>
+          <button onClick={()=>setIsDark(d=>!d)} style={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:8,padding:"7px 12px",cursor:"pointer",fontSize:15,lineHeight:1,color:T.text}}>{isDark?"☀":"☽"}</button>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:10,color:T.textMuted,letterSpacing:"0.1em"}}>QUALITY SCORE</div>
+            <div style={{fontSize:20,fontWeight:700,lineHeight:1}}>{overallScore}<span style={{fontSize:11,color:T.textSub}}>/10</span></div>
+          </div>
+        </div>
+      </header>
+
+      <main style={{flex:1,padding:"32px",maxWidth:1140,margin:"0 auto",width:"100%",boxSizing:"border-box"}}>
+
+        {/* ══════════ TODAY ══════════ */}
+        {view==="today"&&(
+          <div style={{display:"grid",gridTemplateColumns:"220px 1fr",gap:24}}>
+            {/* Left sidebar */}
+            <div style={{display:"flex",flexDirection:"column",gap:16}}>
+              <div style={{...card_,padding:20}}>
+                <div style={{fontSize:10,color:T.textMuted,letterSpacing:"0.15em",marginBottom:16}}>TODAY'S PILLARS</div>
+                {PILLARS.map(p=>{
+                  const hrs=dayBlocks.filter(b=>b.pillar===p.id).reduce((a,b)=>a+slotHrs(b.startHour,b.endHour),0);
+                  const rs=dayBlocks.filter(b=>b.pillar===p.id).map(b=>b.rating);
+                  const avg=rs.length?(rs.reduce((a,b)=>a+b,0)/rs.length).toFixed(1):"—";
+                  return(
+                    <div key={p.id} style={{marginBottom:14}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{color:p.color,fontSize:14}}>{p.icon}</span><span style={{fontSize:12,color:T.textMid}}>{p.label}</span></div>
+                        <div style={{fontSize:11,color:T.textSub}}>{hrs}h · {avg}</div>
+                      </div>
+                      <div style={{height:3,background:T.border,borderRadius:2}}><div style={{height:"100%",width:`${Math.min((hrs/24)*100,100)}%`,background:p.color,borderRadius:2,transition:"width 0.4s"}}/></div>
+                    </div>
+                  );
+                })}
+              </div>
+              {/* Quick-apply templates */}
+              {templates.length>0&&(
+                <div style={{...card_,padding:16}}>
+                  <div style={{fontSize:10,color:T.textMuted,letterSpacing:"0.15em",marginBottom:12}}>QUICK ADD</div>
+                  {templates.map(t=>{
+                    const p=PILLAR_MAP[t.pillar];
+                    return(
+                      <div key={t.id} onClick={()=>applyTemplate(t)} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 8px",borderRadius:6,cursor:"pointer",marginBottom:2,transition:"background 0.15s"}}
+                        onMouseEnter={e=>e.currentTarget.style.background=T.surfaceAlt}
+                        onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                        <span style={{color:p?.color,fontSize:12}}>{p?.icon}</span>
+                        <span style={{fontSize:12,color:T.textMid,flex:1}}>{t.activity}</span>
+                        <span style={{fontSize:10,color:T.textSub}}>{fmtSlot(t.startHour).replace(":00","")}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div style={{...card_,padding:16}}>
+                <div style={{fontSize:10,color:T.textMuted,letterSpacing:"0.15em",marginBottom:12}}>DATES</div>
+                {allDates.slice(0,7).map(d=>(
+                  <div key={d} onClick={()=>setSelectedDate(d)} style={{padding:"8px 10px",borderRadius:6,cursor:"pointer",background:selectedDate===d?T.navActive:"transparent",color:selectedDate===d?T.text:T.textSub,fontSize:12,marginBottom:2,transition:"all 0.15s"}}>{formatDate(d)}</div>
+                ))}
+              </div>
+            </div>
+            {/* Timeline */}
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+                <div>
+                  <div style={{fontSize:22,fontWeight:700}}>{formatDate(selectedDate)}</div>
+                  <div style={{fontSize:12,color:T.textSub,marginTop:2}}>{dayBlocks.length} blocks · {dayBlocks.reduce((a,b)=>a+slotHrs(b.startHour,b.endHour),0).toFixed(1)}h logged</div>
+                </div>
+                <button onClick={()=>openAdd()} style={{background:T.addBtn,color:T.addBtnTxt,border:"none",borderRadius:8,padding:"10px 20px",fontSize:12,fontWeight:700,letterSpacing:"0.1em",cursor:"pointer"}}>+ ADD BLOCK</button>
+              </div>
+              <div style={{...card_,overflow:"hidden"}}>
+                {dayBlocks.length===0
+                  ?<div style={{padding:60,textAlign:"center",color:T.empty,fontSize:14}}>No blocks logged.<br/><span style={{fontSize:12}}>Click "+ Add Block" to start.</span></div>
+                  :dayBlocks.map((block,i)=>{
+                    const p=PILLAR_MAP[block.pillar];
+                    const hrs=slotHrs(block.startHour,block.endHour);
+                    const hasOverlap=findOverlaps(block,blocks).length>0;
+                    return(
+                      <div key={block.id} onMouseEnter={()=>setHoveredBlock(block.id)} onMouseLeave={()=>setHoveredBlock(null)} onClick={()=>openEdit(block)}
+                        style={{display:"grid",gridTemplateColumns:"88px 4px 1fr auto",alignItems:"stretch",borderBottom:i<dayBlocks.length-1?`1px solid ${T.borderSub}`:"none",cursor:"pointer",background:hasOverlap?T.warnBg:hoveredBlock===block.id?T.surfaceAlt:"transparent",transition:"background 0.15s"}}>
+                        <div style={{padding:"14px 12px",textAlign:"right"}}>
+                          <div style={{fontSize:11,color:hasOverlap?"#ff6b6b":T.textSub}}>{fmtSlot(block.startHour)}</div>
+                          <div style={{fontSize:10,color:T.textFaint,marginTop:2}}>→ {fmtSlot(block.endHour)}</div>
+                          <div style={{fontSize:10,color:T.textMuted,marginTop:1}}>{hrs===Math.floor(hrs)?hrs:hrs.toFixed(1)}h</div>
+                        </div>
+                        <div style={{background:p.color,opacity:0.85}}/>
+                        <div style={{padding:"12px 16px"}}>
+                          {hasOverlap&&<div style={{fontSize:10,color:T.warnText,marginBottom:4,letterSpacing:"0.08em"}}>⚠ OVERLAP</div>}
+                          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                            <span style={{fontSize:10,color:p.color,letterSpacing:"0.1em",textTransform:"uppercase"}}>{p.icon} {p.label}</span>
+                          </div>
+                          <div style={{fontSize:14,color:T.text}}>{block.activity}</div>
+                          {block.note&&<div style={{fontSize:11,color:T.textSub,marginTop:4,fontStyle:"italic"}}>{block.note}</div>}
+                        </div>
+                        <div style={{padding:"12px 20px",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                          <div style={{width:34,height:34,borderRadius:"50%",border:`2px solid ${p.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:p.color}}>{block.rating}</div>
+                        </div>
+                      </div>
+                    );
+                  })
+                }
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════ WEEK ══════════ */}
+        {view==="week"&&(
+          <div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:24}}>
+              <div>
+                <div style={{fontSize:22,fontWeight:700}}>{formatWeekRange(weekStart)}</div>
+                <div style={{fontSize:12,color:T.textSub,marginTop:2}}>{weekBlocks.length} blocks · {weekStats.total.toFixed(1)}h · avg {weekStats.avgRating}/10</div>
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                {[["←",-7],["THIS WEEK",0],["→",7]].map(([lbl,n])=>(
+                  <button key={lbl} onClick={()=>n===0?setWeekStart(getWeekStart(today())):setWeekStart(w=>addDays(w,n))}
+                    style={{background:T.surface,border:`1px solid ${T.border}`,color:T.textMid,borderRadius:8,padding:"8px 14px",cursor:"pointer",fontSize:lbl==="THIS WEEK"?11:14,letterSpacing:lbl==="THIS WEEK"?"0.1em":0}}>{lbl}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:24}}>
+              {PILLARS.map(p=>{
+                const hrs=weekStats.pillarHours[p.id],pct=weekStats.total>0?Math.round((hrs/weekStats.total)*100):0;
+                return(
+                  <div key={p.id} style={{background:T.surface,border:`1px solid ${p.color}33`,borderRadius:10,padding:"14px 16px"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><span style={{fontSize:11,color:p.color}}>{p.icon} {p.label}</span><span style={{fontSize:11,color:T.textSub}}>{pct}%</span></div>
+                    <div style={{fontSize:22,fontWeight:700,lineHeight:1}}>{hrs.toFixed(1)}<span style={{fontSize:11,color:T.textSub,fontWeight:400}}>h</span></div>
+                    <div style={{marginTop:8,height:3,background:T.border,borderRadius:2}}><div style={{height:"100%",width:`${pct}%`,background:p.color,borderRadius:2,transition:"width 0.5s"}}/></div>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Weekly reflection card */}
+            <div style={{...card_,padding:24,marginBottom:20}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                <div>
+                  <div style={{fontSize:12,fontWeight:700,letterSpacing:"0.1em",color:T.text}}>✎ WEEKLY REFLECTION</div>
+                  <div style={{fontSize:11,color:T.textSub,marginTop:2}}>How did this week go? What would you change?</div>
+                </div>
+                {currentRefl&&<div style={{fontSize:11,color:T.textSub}}>Last saved {new Date(currentRefl.updatedAt).toLocaleDateString()}</div>}
+              </div>
+              <div style={{display:"flex",gap:16,marginBottom:14,alignItems:"center"}}>
+                <label style={{fontSize:10,color:T.textMuted,letterSpacing:"0.12em",whiteSpace:"nowrap"}}>WEEK RATING</label>
+                <div style={{display:"flex",gap:5,flex:1}}>
+                  {[1,2,3,4,5,6,7,8,9,10].map(n=>(
+                    <button key={n} onClick={()=>setReflForm(f=>({...f,overallRating:n}))}
+                      style={{flex:1,padding:"7px 0",background:reflForm.overallRating>=n?T.navBorder+"33":"transparent",border:reflForm.overallRating>=n?`1px solid ${T.navBorder}`:`1px solid ${T.borderMid}`,borderRadius:4,cursor:"pointer",color:reflForm.overallRating>=n?T.text:T.textFaint,fontSize:11,fontWeight:700,transition:"all 0.1s"}}>{n}</button>
+                  ))}
+                </div>
+                <span style={{fontSize:16,fontWeight:700,color:T.text,minWidth:32,textAlign:"center"}}>{reflForm.overallRating}/10</span>
+              </div>
+              <textarea value={reflForm.text} onChange={e=>setReflForm(f=>({...f,text:e.target.value}))}
+                placeholder="What went well? What drained you? What will you do differently next week?"
+                rows={4}
+                style={{width:"100%",background:T.inputBg,border:`1px solid ${T.borderMid}`,borderRadius:8,padding:"12px 14px",color:T.text,fontSize:13,outline:"none",resize:"vertical",fontFamily:"inherit",boxSizing:"border-box",marginBottom:12}}/>
+              <button onClick={saveReflection} style={{background:T.addBtn,color:T.addBtnTxt,border:"none",borderRadius:8,padding:"9px 20px",cursor:"pointer",fontSize:11,fontWeight:700,letterSpacing:"0.1em"}}>SAVE REFLECTION</button>
+            </div>
+            {/* Day rows */}
+            <div style={{display:"flex",flexDirection:"column",gap:12}}>
+              {weekDates.map(date=>{
+                const isToday=date===today();
+                const dayBs=weekBlocks.filter(b=>b.date===date);
+                const dayHrs=dayBs.reduce((a,b)=>a+slotHrs(b.startHour,b.endHour),0);
+                const dayAvg=dayBs.length?(dayBs.reduce((a,b)=>a+b.rating,0)/dayBs.length).toFixed(1):null;
+                const d=new Date(date+"T12:00:00");
+                return(
+                  <div key={date} style={{background:T.surface,border:isToday?`1px solid ${T.navBorder}`:`1px solid ${T.border}`,borderRadius:12,overflow:"hidden"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 20px",borderBottom:dayBs.length>0?`1px solid ${T.border}`:"none",background:isToday?T.todayBg:"transparent"}}>
+                      <div style={{display:"flex",alignItems:"baseline",gap:10}}>
+                        {isToday&&<span style={{fontSize:9,letterSpacing:"0.15em",background:T.navActive,padding:"2px 7px",borderRadius:4,color:T.text}}>TODAY</span>}
+                        <span style={{fontSize:14,fontWeight:700,color:isToday?T.text:T.textMid}}>{d.toLocaleDateString("en-US",{weekday:"long"})}</span>
+                        <span style={{fontSize:12,color:T.textMuted}}>{d.toLocaleDateString("en-US",{month:"short",day:"numeric"})}</span>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:16}}>
+                        {dayBs.length>0&&<span style={{fontSize:11,color:T.textSub}}>{dayHrs.toFixed(1)}h · <span style={{color:T.textMid}}>{dayAvg}/10</span></span>}
+                        <div style={{display:"flex",gap:4}}>{PILLARS.map(p=><div key={p.id} style={{width:6,height:6,borderRadius:"50%",background:dayBs.some(b=>b.pillar===p.id)?p.color:T.border}}/>)}</div>
+                        <button onClick={()=>{setSelectedDate(date);openAdd(date);setView("today");}} style={{background:"transparent",border:`1px solid ${T.borderMid}`,color:T.textSub,borderRadius:6,padding:"4px 10px",cursor:"pointer",fontSize:11}}>+</button>
+                      </div>
+                    </div>
+                    {dayBs.length===0
+                      ?<div style={{padding:"14px 20px",fontSize:12,color:T.emptyFaint,fontStyle:"italic"}}>Nothing logged</div>
+                      :dayBs.map((block,i)=>{
+                        const p=PILLAR_MAP[block.pillar];
+                        const hasOv=findOverlaps(block,blocks).length>0;
+                        return(
+                          <div key={block.id} onClick={()=>{setSelectedDate(date);openEdit(block);}}
+                            style={{display:"grid",gridTemplateColumns:"80px 3px 1fr auto",alignItems:"stretch",borderBottom:i<dayBs.length-1?`1px solid ${T.borderSub}`:"none",cursor:"pointer",transition:"background 0.15s",background:hasOv?T.warnBg:"transparent"}}
+                            onMouseEnter={e=>e.currentTarget.style.background=hasOv?T.warnBg:T.surfaceAlt}
+                            onMouseLeave={e=>e.currentTarget.style.background=hasOv?T.warnBg:"transparent"}>
+                            <div style={{padding:"10px 10px 10px 20px",textAlign:"right"}}>
+                              <div style={{fontSize:10,color:T.textSub}}>{fmtSlot(block.startHour)}</div>
+                              <div style={{fontSize:9,color:T.textFaint}}>{slotHrs(block.startHour,block.endHour).toFixed(1)}h</div>
+                            </div>
+                            <div style={{background:p.color,opacity:0.8}}/>
+                            <div style={{padding:"10px 14px",display:"flex",alignItems:"center",gap:10}}>
+                              {hasOv&&<span style={{fontSize:10,color:T.warnText}}>⚠</span>}
+                              <span style={{fontSize:11,color:p.color}}>{p.icon}</span>
+                              <span style={{fontSize:13,color:T.textMid}}>{block.activity}</span>
+                            </div>
+                            <div style={{padding:"10px 16px",display:"flex",alignItems:"center"}}>
+                              <span style={{fontSize:12,fontWeight:700,color:p.color}}>{block.rating}</span>
+                            </div>
+                          </div>
+                        );
+                      })
+                    }
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════ DASHBOARD ══════════ */}
+        {view==="dashboard"&&(
+          <div>
+            <div style={{marginBottom:28}}>
+              <div style={{fontSize:22,fontWeight:700}}>Dashboard</div>
+              <div style={{fontSize:12,color:T.textSub,marginTop:2}}>Trends across the last 14 days</div>
+            </div>
+            {dashData.length<2
+              ?<div style={{padding:60,textAlign:"center",color:T.empty,fontSize:14}}>Log at least 2 days of data to see charts.</div>
+              :<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+                <ChartCard title="◐  Sleep Quality → Next-Day Life Quality" subtitle="Does better sleep drive better days? Each dot = one day." T={T}>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <ScatterChart margin={{top:4,right:16,bottom:16,left:-10}}>
+                      <CartesianGrid stroke={T.gridLine} strokeDasharray="3 3"/>
+                      <XAxis dataKey="sleepRating" type="number" domain={[0,10]} tick={{fill:T.textMuted,fontSize:10}} label={{value:"Sleep Rating",position:"insideBottom",offset:-8,fill:T.textMuted,fontSize:10}}/>
+                      <YAxis dataKey="nextDayOverall" type="number" domain={[0,10]} tick={{fill:T.textMuted,fontSize:10}}/>
+                      <Tooltip contentStyle={TT} formatter={(v,n)=>[v,n==="nextDayOverall"?"Next-day score":"Sleep rating"]} labelFormatter={()=>""}/>
+                      <ReferenceLine x={7} stroke={T.refLine} strokeDasharray="4 4"/><ReferenceLine y={7} stroke={T.refLine} strokeDasharray="4 4"/>
+                      <Scatter data={sleepScatterData} fill={PILLAR_MAP.sleep.color} opacity={0.85}/>
+                    </ScatterChart>
+                  </ResponsiveContainer>
+                </ChartCard>
+                <ChartCard title="✦  Daily Quality Score" subtitle="Your overall life quality rating day by day" T={T}>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <LineChart data={dashData} margin={{top:4,right:16,bottom:4,left:-10}}>
+                      <CartesianGrid stroke={T.gridLine} strokeDasharray="3 3"/>
+                      <XAxis dataKey="label" tick={{fill:T.textMuted,fontSize:10}}/><YAxis domain={[0,10]} tick={{fill:T.textMuted,fontSize:10}}/>
+                      <Tooltip contentStyle={TT}/><ReferenceLine y={7} stroke={T.refLine} strokeDasharray="4 4"/>
+                      <Line type="monotone" dataKey="overall" stroke={T.text} strokeWidth={2.5} dot={{r:3,fill:T.text}} name="Overall Score" connectNulls/>
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartCard>
+                <ChartCard title="◈  Pillar Quality Trends" subtitle="How each area of life has been rated over time" span={2} T={T}>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <LineChart data={pillarTrendData} margin={{top:4,right:16,bottom:4,left:-10}}>
+                      <CartesianGrid stroke={T.gridLine} strokeDasharray="3 3"/>
+                      <XAxis dataKey="label" tick={{fill:T.textMuted,fontSize:10}}/><YAxis domain={[0,10]} tick={{fill:T.textMuted,fontSize:10}}/>
+                      <Tooltip contentStyle={TT}/><Legend wrapperStyle={{fontSize:11,color:T.textSub,paddingTop:8}}/>
+                      <ReferenceLine y={7} stroke={T.refLine} strokeDasharray="4 4"/>
+                      {PILLARS.map(p=><Line key={p.id} type="monotone" dataKey={p.label} stroke={p.color} strokeWidth={2} dot={{r:2.5,fill:p.color}} connectNulls/>)}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartCard>
+                <ChartCard title="◈  Work Hours vs Quality" subtitle="Are long days helping or hurting your output?" T={T}>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <LineChart data={workBurnoutData} margin={{top:4,right:16,bottom:4,left:-10}}>
+                      <CartesianGrid stroke={T.gridLine} strokeDasharray="3 3"/>
+                      <XAxis dataKey="label" tick={{fill:T.textMuted,fontSize:10}}/>
+                      <YAxis yAxisId="hrs" orientation="left" domain={[0,14]} tick={{fill:T.textMuted,fontSize:10}}/>
+                      <YAxis yAxisId="qual" orientation="right" domain={[0,10]} tick={{fill:T.textMuted,fontSize:10}}/>
+                      <Tooltip contentStyle={TT}/><Legend wrapperStyle={{fontSize:11,color:T.textSub,paddingTop:8}}/>
+                      <Bar yAxisId="hrs" dataKey="Work Hours" fill={PILLAR_MAP.work.color+"25"} stroke={PILLAR_MAP.work.color+"66"} strokeWidth={1} radius={[3,3,0,0]}/>
+                      <Line yAxisId="qual" dataKey="Work Quality" stroke={PILLAR_MAP.work.color} strokeWidth={2} dot={{r:3,fill:PILLAR_MAP.work.color}} connectNulls/>
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartCard>
+                <ChartCard title="✦  Daily Time Distribution" subtitle="How your hours are split across pillars each day" T={T}>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <BarChart data={pillarStackData} margin={{top:4,right:16,bottom:4,left:-10}}>
+                      <CartesianGrid stroke={T.gridLine} strokeDasharray="3 3"/>
+                      <XAxis dataKey="label" tick={{fill:T.textMuted,fontSize:10}}/><YAxis tick={{fill:T.textMuted,fontSize:10}}/>
+                      <Tooltip contentStyle={TT}/><Legend wrapperStyle={{fontSize:11,color:T.textSub,paddingTop:8}}/>
+                      {PILLARS.map(p=><Bar key={p.id} dataKey={p.label} stackId="a" fill={p.color} opacity={0.85}/>)}
+                    </BarChart>
+                  </ResponsiveContainer>
+                </ChartCard>
+              </div>
+            }
+            {/* Past reflections */}
+            {Object.values(reflections).length>0&&(
+              <div style={{marginTop:32}}>
+                <div style={{fontSize:11,color:T.textMuted,letterSpacing:"0.15em",marginBottom:16}}>WEEKLY REFLECTIONS</div>
+                <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                  {Object.values(reflections).sort((a,b)=>b.weekStart.localeCompare(a.weekStart)).map(r=>(
+                    <div key={r.weekStart} style={{...card_,padding:20}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                        <span style={{fontSize:12,fontWeight:700,color:T.text}}>{formatWeekRange(r.weekStart)}</span>
+                        <div style={{display:"flex",alignItems:"center",gap:8}}>
+                          <span style={{fontSize:11,color:T.textSub}}>Week rating</span>
+                          <div style={{width:32,height:32,borderRadius:"50%",border:`2px solid ${T.navBorder}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:700,color:T.text}}>{r.overallRating}</div>
+                        </div>
+                      </div>
+                      {r.text&&<div style={{fontSize:13,color:T.textMid,lineHeight:1.6,fontStyle:"italic"}}>"{r.text}"</div>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ══════════ ANALYTICS ══════════ */}
+        {view==="analytics"&&(
+          <div>
+            <div style={{marginBottom:28}}>
+              <div style={{fontSize:22,fontWeight:700}}>Analytics</div>
+              <div style={{fontSize:12,color:T.textSub,marginTop:2}}>{blocks.length} total blocks across {allDates.length} days</div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24}}>
+              {analytics.map(p=>(
+                <div key={p.id} style={{background:T.surface,border:`1px solid ${p.color}33`,borderRadius:12,padding:20}}>
+                  <div style={{fontSize:22,color:p.color,marginBottom:8}}>{p.icon}</div>
+                  <div style={{fontSize:11,color:T.textSub,letterSpacing:"0.1em",textTransform:"uppercase",marginBottom:4}}>{p.label}</div>
+                  <div style={{fontSize:28,fontWeight:700,lineHeight:1}}>{p.hours}<span style={{fontSize:12,color:T.textSub,fontWeight:400}}>h</span></div>
+                  <div style={{fontSize:11,color:T.textSub,marginTop:4}}>{p.pct}% of time · avg {p.avgRating}/10</div>
+                  <div style={{marginTop:12,height:4,background:T.border,borderRadius:2}}><div style={{height:"100%",width:`${p.pct}%`,background:p.color,borderRadius:2,transition:"width 0.6s"}}/></div>
+                </div>
+              ))}
+            </div>
+            <div style={{...card_,overflow:"hidden"}}>
+              <div style={{padding:"16px 20px",borderBottom:`1px solid ${T.border}`}}><span style={{fontSize:11,color:T.textMuted,letterSpacing:"0.15em"}}>ALL TIME BLOCKS</span></div>
+              {[...blocks].sort((a,b)=>b.date.localeCompare(a.date)||a.startHour-b.startHour).map((block,i,arr)=>{
+                const p=PILLAR_MAP[block.pillar];
+                return(
+                  <div key={block.id} style={{display:"grid",gridTemplateColumns:"110px 4px 1fr 80px 50px",alignItems:"center",borderBottom:i<arr.length-1?`1px solid ${T.borderSub}`:"none",padding:"10px 0"}}>
+                    <div style={{padding:"0 16px",fontSize:11,color:T.textMuted}}>{formatDate(block.date)}</div>
+                    <div style={{background:p.color,height:20,opacity:0.7,borderRadius:2}}/>
+                    <div style={{padding:"0 16px"}}><span style={{fontSize:12,color:p.color,marginRight:8}}>{p.icon}</span><span style={{fontSize:13,color:T.textMid}}>{block.activity}</span></div>
+                    <div style={{fontSize:11,color:T.textSub,textAlign:"center"}}>{slotHrs(block.startHour,block.endHour).toFixed(1)}h</div>
+                    <div style={{textAlign:"center",fontSize:13,fontWeight:700,color:p.color}}>{block.rating}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════ SETTINGS ══════════ */}
+        {view==="settings"&&(
+          <div style={{maxWidth:640}}>
+            <div style={{marginBottom:32}}>
+              <div style={{fontSize:22,fontWeight:700}}>Settings</div>
+              <div style={{fontSize:12,color:T.textSub,marginTop:2}}>Customize your Existence experience</div>
+            </div>
+            {/* Appearance */}
+            <div style={{...card_,padding:28,marginBottom:20}}>
+              <div style={{fontSize:11,color:T.textMuted,letterSpacing:"0.15em",marginBottom:20}}>APPEARANCE</div>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                <div><div style={{fontSize:14,color:T.text,marginBottom:4}}>Theme</div><div style={{fontSize:12,color:T.textSub}}>Choose between dark and light mode</div></div>
+                <div style={{display:"flex",gap:8}}>
+                  {[["☽ Dark",true],["☀ Light",false]].map(([lbl,val])=>(
+                    <button key={lbl} onClick={()=>setIsDark(val)} style={{background:isDark===val?T.navActive:"transparent",border:`1px solid ${isDark===val?T.navBorder:T.borderMid}`,color:isDark===val?T.text:T.textSub,borderRadius:8,padding:"8px 16px",cursor:"pointer",fontSize:12,transition:"all 0.15s"}}>{lbl}</button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            {/* Pillar colors */}
+            <div style={{...card_,padding:28,marginBottom:20}}>
+              <div style={{fontSize:11,color:T.textMuted,letterSpacing:"0.15em",marginBottom:8}}>PILLAR COLORS</div>
+              <div style={{fontSize:12,color:T.textSub,marginBottom:24}}>Click a swatch to change. Colors apply everywhere across the app.</div>
+              {PILLARS.map(p=>(
+                <div key={p.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"16px 0",borderBottom:`1px solid ${T.border}`}}>
+                  <div style={{display:"flex",alignItems:"center",gap:14}}>
+                    <span style={{fontSize:22,color:p.color}}>{p.icon}</span>
+                    <div><div style={{fontSize:14,color:T.text,fontWeight:600}}>{p.label}</div><div style={{fontSize:11,color:T.textSub,marginTop:2}}>{p.color.toUpperCase()}</div></div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:12}}>
+                    <div style={{background:p.color+"22",border:`1px solid ${p.color}55`,borderRadius:20,padding:"4px 12px",fontSize:11,color:p.color}}>{p.label} Block</div>
+                    <ColorPicker value={p.color} onChange={color=>setPillarColors(prev=>({...prev,[p.id]:color}))} T={T}/>
+                  </div>
+                </div>
+              ))}
+              <button onClick={()=>setPillarColors(Object.fromEntries(DEFAULT_PILLARS.map(p=>[p.id,p.color])))} style={{marginTop:20,background:"transparent",border:`1px solid ${T.borderMid}`,color:T.textSub,borderRadius:8,padding:"8px 16px",cursor:"pointer",fontSize:12}}>Reset to defaults</button>
+            </div>
+            {/* Templates */}
+            <div style={{...card_,padding:28}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div style={{fontSize:11,color:T.textMuted,letterSpacing:"0.15em"}}>RECURRING TEMPLATES</div>
+                <button onClick={openAddTpl} style={{background:"transparent",border:`1px solid ${T.borderMid}`,color:T.textSub,borderRadius:6,padding:"5px 12px",cursor:"pointer",fontSize:11}}>+ New Template</button>
+              </div>
+              <div style={{fontSize:12,color:T.textSub,marginBottom:20}}>Templates appear as quick-add shortcuts on the Today view.</div>
+              {templates.length===0
+                ?<div style={{padding:"20px 0",textAlign:"center",color:T.emptyFaint,fontSize:13,fontStyle:"italic"}}>No templates yet — create one to get started.</div>
+                :templates.map(t=>{
+                  const p=PILLAR_MAP[t.pillar];
+                  return(
+                    <div key={t.id} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 0",borderBottom:`1px solid ${T.border}`}}>
+                      <span style={{fontSize:18,color:p?.color}}>{p?.icon}</span>
+                      <div style={{flex:1}}>
+                        <div style={{fontSize:13,color:T.text}}>{t.activity}</div>
+                        <div style={{fontSize:11,color:T.textSub,marginTop:2}}>{p?.label} · {fmtSlot(t.startHour)} – {fmtSlot(t.endHour)} ({slotHrs(t.startHour,t.endHour).toFixed(1)}h)</div>
+                      </div>
+                      <button onClick={()=>openEditTpl(t)} style={{background:"transparent",border:`1px solid ${T.borderMid}`,color:T.textSub,borderRadius:6,padding:"5px 10px",cursor:"pointer",fontSize:11}}>Edit</button>
+                    </div>
+                  );
+                })
+              }
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* ══════════ BLOCK MODAL ══════════ */}
+      {showModal&&(
+        <div style={{position:"fixed",inset:0,background:isDark?"rgba(0,0,0,0.85)":"rgba(0,0,0,0.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}} onClick={e=>e.target===e.currentTarget&&setShowModal(false)}>
+          <div style={{background:T.surface,border:`1px solid ${activePillar?.color}55`,borderRadius:16,padding:32,width:500,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
+            <div style={{fontSize:14,fontWeight:700,letterSpacing:"0.1em",marginBottom:24,color:T.text}}>{editBlock?"EDIT BLOCK":"ADD TIME BLOCK"}</div>
+            {/* Pillar */}
+            <div style={{marginBottom:20}}>
+              <label style={lbl_}>PILLAR</label>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+                {PILLARS.map(p=>(
+                  <button key={p.id} onClick={()=>handleFormChange({pillar:p.id})} style={{background:form.pillar===p.id?p.color+"22":T.inputBg,border:form.pillar===p.id?`1px solid ${p.color}`:`1px solid ${T.borderMid}`,borderRadius:8,padding:"10px 6px",cursor:"pointer",color:form.pillar===p.id?p.color:T.textSub,fontSize:11,textAlign:"center",transition:"all 0.15s"}}>
+                    <div style={{fontSize:18,marginBottom:4}}>{p.icon}</div>{p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* Activity */}
+            <div style={{marginBottom:16}}>
+              <label style={lbl_}>ACTIVITY</label>
+              <input value={form.activity} onChange={e=>handleFormChange({activity:e.target.value})} placeholder="What were you doing?" style={inp_}/>
+            </div>
+            {/* Time */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:overlapWarn.length>0?8:16}}>
+              {[["START TIME","startHour"],["END TIME","endHour"]].map(([lbl,key])=>(
+                <div key={key}>
+                  <label style={lbl_}>{lbl}</label>
+                  <SlotSelect value={form[key]} onChange={v=>handleFormChange({[key]:v})} T={T}/>
+                </div>
+              ))}
+            </div>
+            {/* Overlap warning */}
+            {overlapWarn.length>0&&(
+              <div style={{background:T.warnBg,border:`1px solid ${T.warnBorder}`,borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:12,color:T.warnText}}>
+                ⚠ Overlaps with: {overlapWarn.map(b=>`"${b.activity}" (${fmtSlot(b.startHour)}–${fmtSlot(b.endHour)})`).join(", ")}
+              </div>
+            )}
+            {/* Rating */}
+            <div style={{marginBottom:16}}>
+              <label style={lbl_}>QUALITY RATING — <span style={{color:activePillar?.color}}>{form.rating}/10</span></label>
+              <div style={{display:"flex",gap:6}}>
+                {[1,2,3,4,5,6,7,8,9,10].map(n=>(
+                  <button key={n} onClick={()=>setForm(f=>({...f,rating:n}))} style={{flex:1,aspectRatio:"1",background:form.rating>=n?activePillar?.color+"33":T.inputBg,border:form.rating>=n?`1px solid ${activePillar?.color}`:`1px solid ${T.borderMid}`,borderRadius:4,cursor:"pointer",color:form.rating>=n?activePillar?.color:T.textFaint,fontSize:11,fontWeight:700,transition:"all 0.1s"}}>{n}</button>
+                ))}
+              </div>
+            </div>
+            {/* Note */}
+            <div style={{marginBottom:24}}>
+              <label style={lbl_}>NOTE (optional)</label>
+              <textarea value={form.note} onChange={e=>setForm(f=>({...f,note:e.target.value}))} placeholder="Any observations or insights..." rows={2} style={{...inp_,resize:"vertical",fontFamily:"inherit"}}/>
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              {editBlock&&<button onClick={()=>deleteBlock(editBlock.id)} style={{background:"transparent",border:"1px solid #ff444433",color:"#ff4444",borderRadius:8,padding:"10px 16px",cursor:"pointer",fontSize:12}}>Delete</button>}
+              <button onClick={()=>setShowModal(false)} style={{flex:1,background:"transparent",border:`1px solid ${T.borderMid}`,color:T.textSub,borderRadius:8,padding:"10px",cursor:"pointer",fontSize:12}}>Cancel</button>
+              <button onClick={saveBlock} style={{flex:2,background:activePillar?.color,border:"none",color:"#080808",borderRadius:8,padding:"10px",cursor:"pointer",fontSize:12,fontWeight:700,letterSpacing:"0.08em"}}>{editBlock?"SAVE CHANGES":"ADD BLOCK"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══════════ TEMPLATE MODAL ══════════ */}
+      {showTplModal&&(
+        <div style={{position:"fixed",inset:0,background:isDark?"rgba(0,0,0,0.85)":"rgba(0,0,0,0.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}} onClick={e=>e.target===e.currentTarget&&setShowTplModal(false)}>
+          <div style={{background:T.surface,border:`1px solid ${tplPillar?.color}55`,borderRadius:16,padding:32,width:460,maxWidth:"92vw",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
+            <div style={{fontSize:14,fontWeight:700,letterSpacing:"0.1em",marginBottom:24,color:T.text}}>{editTpl?"EDIT TEMPLATE":"NEW TEMPLATE"}</div>
+            <div style={{marginBottom:20}}>
+              <label style={lbl_}>PILLAR</label>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8}}>
+                {PILLARS.map(p=>(
+                  <button key={p.id} onClick={()=>setTplForm(f=>({...f,pillar:p.id}))} style={{background:tplForm.pillar===p.id?p.color+"22":T.inputBg,border:tplForm.pillar===p.id?`1px solid ${p.color}`:`1px solid ${T.borderMid}`,borderRadius:8,padding:"10px 6px",cursor:"pointer",color:tplForm.pillar===p.id?p.color:T.textSub,fontSize:11,textAlign:"center",transition:"all 0.15s"}}>
+                    <div style={{fontSize:18,marginBottom:4}}>{p.icon}</div>{p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={{marginBottom:16}}>
+              <label style={lbl_}>ACTIVITY NAME</label>
+              <input value={tplForm.activity} onChange={e=>setTplForm(f=>({...f,activity:e.target.value}))} placeholder="e.g. Morning workout" style={inp_}/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:24}}>
+              {[["DEFAULT START","startHour"],["DEFAULT END","endHour"]].map(([lbl,key])=>(
+                <div key={key}>
+                  <label style={lbl_}>{lbl}</label>
+                  <SlotSelect value={tplForm[key]} onChange={v=>setTplForm(f=>({...f,[key]:v}))} T={T}/>
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              {editTpl&&<button onClick={()=>deleteTpl(editTpl.id)} style={{background:"transparent",border:"1px solid #ff444433",color:"#ff4444",borderRadius:8,padding:"10px 16px",cursor:"pointer",fontSize:12}}>Delete</button>}
+              <button onClick={()=>setShowTplModal(false)} style={{flex:1,background:"transparent",border:`1px solid ${T.borderMid}`,color:T.textSub,borderRadius:8,padding:"10px",cursor:"pointer",fontSize:12}}>Cancel</button>
+              <button onClick={saveTpl} style={{flex:2,background:tplPillar?.color,border:"none",color:"#080808",borderRadius:8,padding:"10px",cursor:"pointer",fontSize:12,fontWeight:700,letterSpacing:"0.08em"}}>{editTpl?"SAVE TEMPLATE":"CREATE TEMPLATE"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
