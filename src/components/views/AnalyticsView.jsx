@@ -1,7 +1,9 @@
-import { formatDate, fmtSlot, slotHrs } from "../../constants";
+import { useMemo } from "react";
+import { formatDate, slotHrs } from "../../constants";
 
 export default function AnalyticsView({ T, PILLARS, PILLAR_MAP, blocks, allDates, analytics }) {
   const card_ = { background:T.surface, border:`1px solid ${T.border}`, borderRadius:12 };
+  const sortedBlocks = useMemo(() => [...blocks].sort((a,b) => b.date.localeCompare(a.date) || a.startHour - b.startHour), [blocks]);
 
   return (
     <div>
@@ -32,8 +34,8 @@ export default function AnalyticsView({ T, PILLARS, PILLAR_MAP, blocks, allDates
         <div style={{ padding:"16px 20px", borderBottom:`1px solid ${T.border}` }}>
           <span style={{ fontSize:11, color:T.textMuted, letterSpacing:"0.15em" }}>ALL TIME BLOCKS</span>
         </div>
-        {[...blocks].sort((a,b) => b.date.localeCompare(a.date) || a.startHour - b.startHour).map((block, i, arr) => {
-          const p = PILLAR_MAP[block.pillar];
+        {sortedBlocks.map((block, i, arr) => {
+          const p = PILLAR_MAP[block.pillar] || { color: "#666", icon: "❓", label: "Unknown" };
           return (
             <div
               key={block.id}

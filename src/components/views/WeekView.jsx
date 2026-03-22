@@ -124,7 +124,7 @@ export default function WeekView({
               {dayBs.length === 0
                 ? <div style={{ padding:"14px 20px", fontSize:12, color:T.emptyFaint, fontStyle:"italic" }}>Nothing logged</div>
                 : dayBs.map((block, i) => {
-                    const p     = PILLAR_MAP[block.pillar];
+                    const p     = PILLAR_MAP[block.pillar] || { color: "#666", icon: "❓", label: "Unknown" };
                     const hasOv = findOverlaps(block, blocks).length > 0;
                     return (
                       <div

@@ -13,17 +13,21 @@ export default function ColorPicker({ value, onChange, T }) {
 
   return (
     <div ref={ref} style={{ position:"relative" }}>
-      <div
+      <button
+        type="button"
+        aria-label="Choose color"
         onClick={() => setOpen(o => !o)}
-        style={{ width:36, height:36, borderRadius:8, background:value, cursor:"pointer", border:`2px solid ${T.border}`, boxShadow: open ? `0 0 0 2px ${value}44` : "none", transition:"box-shadow 0.15s" }}
+        style={{ width:36, height:36, borderRadius:8, background:value, cursor:"pointer", border:`2px solid ${T.border}`, boxShadow: open ? `0 0 0 2px ${value}44` : "none", transition:"box-shadow 0.15s", padding:0 }}
       />
       {open && (
         <div style={{ position:"absolute", top:44, left:0, zIndex:300, background:T.surface, border:`1px solid ${T.border}`, borderRadius:12, padding:12, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6, width:172, boxShadow:"0 8px 32px rgba(0,0,0,0.3)" }}>
           {PRESET_COLORS.map(c => (
-            <div
+            <button
               key={c}
+              type="button"
+              aria-label={`Select color ${c}`}
               onClick={() => { onChange(c); setOpen(false); }}
-              style={{ width:32, height:32, borderRadius:6, background:c, cursor:"pointer", border: value === c ? `2px solid ${T.text}` : "2px solid transparent", transition:"border 0.1s", boxSizing:"border-box" }}
+              style={{ width:32, height:32, borderRadius:6, background:c, cursor:"pointer", border: value === c ? `2px solid ${T.text}` : "2px solid transparent", transition:"border 0.1s", boxSizing:"border-box", padding:0 }}
             />
           ))}
           <div style={{ gridColumn:"span 4", marginTop:4 }}>

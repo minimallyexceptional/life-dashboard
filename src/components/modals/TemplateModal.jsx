@@ -12,6 +12,8 @@ export default function TemplateModal({
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
       style={{ position:"fixed", inset:0, background: isDark ? "rgba(0,0,0,0.85)" : "rgba(0,0,0,0.4)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000 }}
       onClick={e => e.target === e.currentTarget && setShowTplModal(false)}
     >

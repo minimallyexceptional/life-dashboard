@@ -1,5 +1,5 @@
 import {
-  LineChart, Line, BarChart, Bar, ScatterChart, Scatter,
+  LineChart, Line, BarChart, Bar, ComposedChart, ScatterChart, Scatter,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine,
 } from "recharts";
 import ChartCard from "../ChartCard";
@@ -66,7 +66,7 @@ export default function DashboardView({
 
             <ChartCard title="◈  Work Hours vs Quality" subtitle="Are long days helping or hurting your output?" T={T}>
               <ResponsiveContainer width="100%" height={220}>
-                <LineChart data={workBurnoutData} margin={{ top:4, right:16, bottom:4, left:-10 }}>
+                <ComposedChart data={workBurnoutData} margin={{ top:4, right:16, bottom:4, left:-10 }}>
                   <CartesianGrid stroke={T.gridLine} strokeDasharray="3 3"/>
                   <XAxis dataKey="label" tick={{ fill:T.textMuted, fontSize:10 }}/>
                   <YAxis yAxisId="hrs" orientation="left" domain={[0,14]} tick={{ fill:T.textMuted, fontSize:10 }}/>
@@ -75,7 +75,7 @@ export default function DashboardView({
                   <Legend wrapperStyle={{ fontSize:11, color:T.textSub, paddingTop:8 }}/>
                   <Bar yAxisId="hrs" dataKey="Work Hours" fill={PILLAR_MAP.work.color+"25"} stroke={PILLAR_MAP.work.color+"66"} strokeWidth={1} radius={[3,3,0,0]}/>
                   <Line yAxisId="qual" dataKey="Work Quality" stroke={PILLAR_MAP.work.color} strokeWidth={2} dot={{ r:3, fill:PILLAR_MAP.work.color }} connectNulls/>
-                </LineChart>
+                </ComposedChart>
               </ResponsiveContainer>
             </ChartCard>
 

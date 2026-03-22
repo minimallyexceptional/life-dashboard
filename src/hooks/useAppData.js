@@ -63,7 +63,11 @@ export function useAppData() {
           const s = buildSamples();
           db.blocks.bulkAdd(s)
             .then(() => { setBlocks(s); setTemplates(tpls); loadReflections(refls); setDbReady(true); })
-            .catch(err => { console.error("Failed to seed DB:", err); setBlocks(s); setTemplates(tpls); loadReflections(refls); setDbReady(true); });
+            .catch(async err => {
+              console.error("Failed to seed DB:", err);
+              const saved = await db.blocks.toArray().catch(() => []);
+              setBlocks(saved); setTemplates(tpls); loadReflections(refls); setDbReady(true);
+            });
         } else {
           setBlocks(blks); setTemplates(tpls); loadReflections(refls); setDbReady(true);
         }
@@ -162,8 +166,9 @@ export function useAppData() {
   }
 
   function checkOverlaps(f, exceptId) {
-    const candidate = { ...f, id: exceptId || "__new__" };
-    const others = blocks.filter(b => b.date === selectedDate && b.id !== exceptId);
+    const targetDate = f.date ?? selectedDate;
+    const candidate = { ...f, id: exceptId || "__new__", date: targetDate };
+    const others = blocks.filter(b => b.date === targetDate && b.id !== exceptId);
     return others.filter(b => blocksOverlap(candidate, b));
   }
 
@@ -178,7 +183,7 @@ export function useAppData() {
     if (form.startHour === form.endHour) { alert("End time must differ from start time."); return; }
     try {
       if (editBlock) {
-        const updated = { ...form, id:editBlock.id, date:selectedDate };
+        const updated = { ...form, id:editBlock.id, date: form.date ?? selectedDate };
         await db.blocks.put(updated);
         setBlocks(prev => prev.map(b => b.id === editBlock.id ? updated : b));
       } else {
@@ -206,11 +211,17 @@ export function useAppData() {
 
   async function applyTemplate(tpl) {
     const nb = { id:generateId(), date:selectedDate, pillar:tpl.pillar, activity:tpl.activity, startHour:tpl.startHour, endHour:tpl.endHour, rating:7, note:"" };
+    const overlaps = blocks.filter(b => b.date === selectedDate && blocksOverlap(nb, b));
+    if (overlaps.length > 0) {
+      const names = overlaps.map(b => b.activity).join(", ");
+      if (!confirm(`"${tpl.activity}" overlaps with: ${names}. Add anyway?`)) return;
+    }
     try {
       await db.blocks.add(nb);
       setBlocks(prev => [...prev, nb]);
     } catch (err) {
       console.error("Failed to apply template:", err);
+      alert("Failed to add block. Please try again.");
     }
   }
 

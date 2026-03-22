@@ -28,6 +28,8 @@ export default function Header({ T, view, setView, isDark, setIsDark, overallSco
       <div style={{ display:"flex", alignItems:"center", gap:16 }}>
         <button
           onClick={() => setIsDark(d => !d)}
+          aria-label={isDark ? "Switch to light theme" : "Switch to dark theme"}
+          aria-pressed={isDark}
           style={{ background:T.surface, border:`1px solid ${T.border}`, borderRadius:8, padding:"7px 12px", cursor:"pointer", fontSize:15, lineHeight:1, color:T.text }}
         >
           {isDark ? "☀" : "☽"}

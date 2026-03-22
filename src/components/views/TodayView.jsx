@@ -99,7 +99,7 @@ export default function TodayView({
                 No blocks logged.<br/><span style={{ fontSize:12 }}>Click "+ Add Block" to start.</span>
               </div>
             : dayBlocks.map((block, i) => {
-                const p          = PILLAR_MAP[block.pillar];
+                const p          = PILLAR_MAP[block.pillar] || { color: "#666", icon: "❓", label: "Unknown" };
                 const hrs        = slotHrs(block.startHour, block.endHour);
                 const hasOverlap = findOverlaps(block, blocks).length > 0;
                 return (
