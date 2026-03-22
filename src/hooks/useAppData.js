@@ -61,13 +61,14 @@ export function useAppData() {
       .then(([blks, tpls, refls]) => {
         if (blks.length === 0) {
           const s = buildSamples();
-          db.blocks.bulkAdd(s).then(() => {
-            setBlocks(s); setTemplates(tpls); loadReflections(refls); setDbReady(true);
-          });
+          db.blocks.bulkAdd(s)
+            .then(() => { setBlocks(s); setTemplates(tpls); loadReflections(refls); setDbReady(true); })
+            .catch(err => { console.error("Failed to seed DB:", err); setBlocks(s); setTemplates(tpls); loadReflections(refls); setDbReady(true); });
         } else {
           setBlocks(blks); setTemplates(tpls); loadReflections(refls); setDbReady(true);
         }
-      });
+      })
+      .catch(err => { console.error("DB init failed:", err); setDbReady(true); });
   }, []);
 
   function loadReflections(rows) {
@@ -174,29 +175,43 @@ export function useAppData() {
 
   async function saveBlock() {
     if (!form.activity.trim()) return;
-    if (form.startHour >= form.endHour) { alert("End time must be after start time."); return; }
-    if (editBlock) {
-      const updated = { ...form, id:editBlock.id, date:selectedDate };
-      await db.blocks.put(updated);
-      setBlocks(prev => prev.map(b => b.id === editBlock.id ? updated : b));
-    } else {
-      const nb = { ...form, id:generateId(), date:selectedDate };
-      await db.blocks.add(nb);
-      setBlocks(prev => [...prev, nb]);
+    if (form.startHour === form.endHour) { alert("End time must differ from start time."); return; }
+    try {
+      if (editBlock) {
+        const updated = { ...form, id:editBlock.id, date:selectedDate };
+        await db.blocks.put(updated);
+        setBlocks(prev => prev.map(b => b.id === editBlock.id ? updated : b));
+      } else {
+        const nb = { ...form, id:generateId(), date:selectedDate };
+        await db.blocks.add(nb);
+        setBlocks(prev => [...prev, nb]);
+      }
+      setShowModal(false);
+    } catch (err) {
+      console.error("Failed to save block:", err);
+      alert("Failed to save. Please try again.");
     }
-    setShowModal(false);
   }
 
   async function deleteBlock(id) {
-    await db.blocks.delete(id);
-    setBlocks(prev => prev.filter(b => b.id !== id));
-    setShowModal(false);
+    try {
+      await db.blocks.delete(id);
+      setBlocks(prev => prev.filter(b => b.id !== id));
+      setShowModal(false);
+    } catch (err) {
+      console.error("Failed to delete block:", err);
+      alert("Failed to delete. Please try again.");
+    }
   }
 
   async function applyTemplate(tpl) {
     const nb = { id:generateId(), date:selectedDate, pillar:tpl.pillar, activity:tpl.activity, startHour:tpl.startHour, endHour:tpl.endHour, rating:7, note:"" };
-    await db.blocks.add(nb);
-    setBlocks(prev => [...prev, nb]);
+    try {
+      await db.blocks.add(nb);
+      setBlocks(prev => [...prev, nb]);
+    } catch (err) {
+      console.error("Failed to apply template:", err);
+    }
   }
 
   // ── Template CRUD ──────────────────────────────────────────────────────────
@@ -214,29 +229,44 @@ export function useAppData() {
 
   async function saveTpl() {
     if (!tplForm.activity.trim()) return;
-    if (editTpl) {
-      const u = { ...tplForm, id:editTpl.id };
-      await db.templates.put(u);
-      setTemplates(prev => prev.map(t => t.id === editTpl.id ? u : t));
-    } else {
-      const nt = { ...tplForm, id:generateId() };
-      await db.templates.add(nt);
-      setTemplates(prev => [...prev, nt]);
+    try {
+      if (editTpl) {
+        const u = { ...tplForm, id:editTpl.id };
+        await db.templates.put(u);
+        setTemplates(prev => prev.map(t => t.id === editTpl.id ? u : t));
+      } else {
+        const nt = { ...tplForm, id:generateId() };
+        await db.templates.add(nt);
+        setTemplates(prev => [...prev, nt]);
+      }
+      setShowTplModal(false);
+    } catch (err) {
+      console.error("Failed to save template:", err);
+      alert("Failed to save. Please try again.");
     }
-    setShowTplModal(false);
   }
 
   async function deleteTpl(id) {
-    await db.templates.delete(id);
-    setTemplates(prev => prev.filter(t => t.id !== id));
-    setShowTplModal(false);
+    try {
+      await db.templates.delete(id);
+      setTemplates(prev => prev.filter(t => t.id !== id));
+      setShowTplModal(false);
+    } catch (err) {
+      console.error("Failed to delete template:", err);
+      alert("Failed to delete. Please try again.");
+    }
   }
 
   // ── Reflection CRUD ────────────────────────────────────────────────────────
   async function saveReflection() {
     const r = { weekStart, overallRating:reflForm.overallRating, text:reflForm.text, updatedAt:new Date().toISOString() };
-    await db.reflections.put(r);
-    setReflections(prev => ({ ...prev, [weekStart]:r }));
+    try {
+      await db.reflections.put(r);
+      setReflections(prev => ({ ...prev, [weekStart]:r }));
+    } catch (err) {
+      console.error("Failed to save reflection:", err);
+      alert("Failed to save. Please try again.");
+    }
   }
 
   return {

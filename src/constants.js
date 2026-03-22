@@ -48,7 +48,7 @@ export const today       = () => new Date().toISOString().slice(0, 10);
 export const formatDate  = d => new Date(d+"T12:00:00").toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
 export const shortDate   = d => new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric"});
 export const fmtSlot     = v => { const h=Math.floor(v),m=v%1===0.5?"30":"00",h12=h%12===0?12:h%12; return `${h12}:${m} ${h<12?"AM":"PM"}`; };
-export const slotHrs     = (s, e) => e - s;
+export const slotHrs     = (s, e) => e > s ? e - s : (24 - s) + e;
 
 export function getWeekStart(ds) {
   const d = new Date(ds+"T12:00:00");
